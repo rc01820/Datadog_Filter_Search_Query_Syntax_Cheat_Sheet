@@ -4,16 +4,18 @@
 >
 > **Validate before you automate.** Facet names, metric names, tag keys, and some UI capabilities vary by Datadog site, product entitlement, Agent/integration version, and organization configuration. Confirm names in **Metrics Explorer**, the relevant **facet panel**, autocomplete, or a live API response before scaling a monitor, dashboard, notification rule, or script.
 >
-> **Last reviewed:** September 17, 2026  
+> **Last reviewed:** September 20, 2026  
 > **Example convention:** Examples use generic Neomon Labs-style tags such as `env:prod`, `app:abc`, `costcenter:eoc`, `site:bos`, and `team:noc`.
 >
 > **Merged edition:** Consolidates the two supplied Datadog syntax cheat sheets into one de-duplicated operational reference.
+>
+> **Revision 2 (September 20, 2026):** Adds **Part II** (sections 25-36) covering RUM, Error Tracking, CI Visibility, security signals, SLOs, Audit Trail, DDSQL, notebooks and saved views, tag-governance APIs, and Terraform. Also adds case-sensitivity and tokenization rules (4.6), facets vs. measures and Live Tail behavior (9.17-9.19), API encoding/pagination/rate-limit guidance (17.8), and eight further gotchas (20.11).
 
 ---
 
 ## Table of Contents
 
-1. [Mental model: the three syntax families](#1-mental-model-the-three-syntax-families)
+1. [Mental model: the syntax families](#1-mental-model-the-syntax-families)
 2. [Side-by-side master cheat sheet](#2-side-by-side-master-cheat-sheet)
 3. [Common tag model](#3-common-tag-model)
 4. [Boolean operators, wildcards, escaping](#4-boolean-operators-wildcards-and-escaping)
@@ -38,20 +40,36 @@
 23. [Official references](#23-official-references)
 24. [One-page decision tree](#24-one-page-decision-tree)
 
+**Part II - extended product surfaces**
+
+25. [Real User Monitoring (RUM) and Session Replay](#25-real-user-monitoring-rum-and-session-replay)
+26. [Error Tracking](#26-error-tracking)
+27. [CI Visibility and Test Optimization](#27-ci-visibility-and-test-optimization)
+28. [Security signals (Cloud SIEM, Workload Protection, AAP)](#28-security-signals-cloud-siem-workload-protection-and-app-and-api-protection)
+29. [Service Level Objectives](#29-service-level-objectives)
+30. [Audit Trail](#30-audit-trail)
+31. [DDSQL - SQL over Datadog data](#31-ddsql--sql-over-datadog-data)
+32. [Notebooks, saved views, and shareable URLs](#32-notebooks-saved-views-and-shareable-urls)
+33. [Tag governance surfaces](#33-tag-governance-surfaces)
+34. [Terraform and query-as-code](#34-terraform-and-query-as-code)
+35. [Other surfaces in brief](#35-other-surfaces-in-brief)
+36. [Part II decision addendum](#36-part-ii-decision-addendum)
+
 ---
 
-# 1. Mental model: the three syntax families
+# 1. Mental model: the syntax families
 
 
-## 1.1 The three syntax families at a glance
+## 1.1 The syntax families at a glance
 
-Almost every Datadog search box uses one of three grammars. Knowing which one you're in solves most "why doesn't this match" problems.
+Almost every Datadog search box uses one of four grammars: three search grammars, plus SQL for the newer DDSQL surfaces. Knowing which one you're in solves most "why doesn't this match" problems.
 
 | Family | Used by | Shape | Negation | AND | Attributes |
 |---|---|---|---|---|---|
 | **Tag scope** | Metrics, metric monitors, APM trace metrics, NDM metrics, container metrics, DBM metrics | `{key:value,key:value}` | `!key:value` | `,` or `AND` | Tags only — no `@` |
 | **Event-platform search** | Logs, Spans/Traces, Events (new), RUM, Synthetics results, DBM samples, CI, Audit | `key:value @attr:value "text"` | `-key:value` or `NOT` | space or `AND` | Reserved attrs bare, custom attrs with `@` |
 | **Faceted list search** | Monitor list, Host list, Synthetics test list, Dashboard list, Containers/K8s explorers, NDM device list | `facet:value free text` | `-facet:value` or `NOT` | space or `AND` | Product-specific facets |
+| **SQL (DDSQL)** | DDSQL Explorer, notebook SQL cells, `dd.*` datasets, tabular query API | `SELECT ... FROM dd.hosts WHERE ...` | `NOT`, `<>` | `AND` | SQL columns; event-search strings passed as table-function arguments |
 
 ---
 
@@ -448,8 +466,19 @@ env:prod AND (service:web OR service:api)
 Event-platform (logs/APM/events) special characters that must be escaped with `\` or wrapped in quotes:
 
 ```text
-+ - = && || > < ! ( ) { } [ ] ^ " “ ” ~ * ? : \ /  and spaces
++ - = && || > >= < <= ! ( ) { } [ ] ^ " “ ” ~ * ? : \ #   and spaces
 ```
+
+Two corrections worth internalizing:
+
+- **`/` is *not* special** in log search and does not need escaping. (RUM and some
+  other explorers *do* escape `/` in path values - see 25.3 - so the habit is
+  harmless, but it is not required in Logs.)
+- **`#` is special** and does need escaping - easy to miss in Windows paths,
+  channel names, and issue references.
+
+The published character list varies slightly between product docs. The union
+above is the safe superset; when in doubt, quote the whole value.
 
 | Want | Syntax |
 |---|---|
@@ -462,6 +491,53 @@ Event-platform (logs/APM/events) special characters that must be escaped with `\
 | Wildcards inside quotes | not expanded — `"web*"` is literal |
 
 URL-encode every query string sent via GET (`{`, `}`, `:`, spaces, quotes, `[`, `]`).
+
+
+## 4.6 Case sensitivity, tokenization, and the `?` wildcard
+
+More "why doesn't this match" problems come from these five rules than from
+anything else in this document.
+
+**1. Boolean operators are case sensitive.** `AND`, `OR`, `NOT` must be
+uppercase in event-platform search. Lowercase `and` is treated as a search term,
+so `service:web and status:error` quietly searches for the literal word `and`.
+
+**2. Attribute and tag searches are case sensitive.** `@env:Prod` and
+`@env:prod` are different values. The Agent lowercases tag values on ingestion,
+but API and DogStatsD submissions may preserve case, which is how an estate ends
+up with `env:Prod`, `env:PROD`, and `env:prod` as three distinct dimensions.
+Normalize before submission on every path.
+
+**3. Full-text search is case *in*sensitive.** When you cannot control case at
+the source, `*:term` gives case-insensitive matching, or apply a `lowercase`
+filter in the Grok parser so the parsed attribute is normalized at index time.
+
+**4. `?` matches exactly one character.** This is the escape hatch for values
+containing spaces or special characters:
+
+```text
+@my_attribute:hello?world     # matches "hello world" or "hello:world"
+@my_attribute:"hello:world"   # equivalent, using quotes
+@my_attribute:hello\:world    # equivalent, using escaping
+```
+
+**5. `@` is reserved.** It cannot appear in a free-text term in Log Explorer
+because it always introduces an attribute search. Similarly, you cannot search
+for special characters in the raw log *message* at all - parse them into an
+attribute with the Grok Parser first, then search the attribute.
+
+### Free text vs. full text
+
+| Syntax | Searches | Case |
+|---|---|---|
+| `timeout` | The log message (and selected error fields) | insensitive |
+| `"connection refused"` | The message, as a phrase | insensitive |
+| `*:timeout` | **All** attributes, including the message | insensitive |
+| `@error.message:timeout` | That one attribute, exact value semantics | **sensitive** |
+
+Full-text search is a Log Management feature and works in monitor, dashboard,
+and notebook queries - but it is not accepted everywhere a query box exists
+(see 9.15 for pipeline, index, and archive filters).
 
 
 ---
@@ -1457,6 +1533,72 @@ Filter:    service:web status:error
 Measure:   count  | @duration (distribution)
 Group by:  service, env, @http.status_code
 ```
+
+
+---
+
+
+## 9.17 Facets vs. measures
+
+A **facet** is an indexed string dimension. A **measure** is an indexed numeric
+dimension, optionally carrying a unit. The distinction decides what you are
+allowed to do with an attribute:
+
+| Operation | Needs a facet/measure? |
+|---|---|
+| `@attr:value` exact match | No - works on any attribute |
+| `@attr:*` existence | No |
+| `@attr:>100`, `@attr:[1 TO 5]` | **Yes** - must be a measure |
+| Group by in the explorer | **Yes** |
+| Group by in a log-based metric | **Yes** |
+| Sort a column by value | **Yes** |
+
+Units matter: a measure defined in seconds accepts `@view.loading_time:[1s TO 3s]`,
+while the standard log attribute `@duration` is in **nanoseconds**
+(`@duration:>1000000000` is one second). Mixing the two is a common source of
+monitors that never fire.
+
+Every facet and measure you create is also a dimension someone will later group
+a monitor by, so treat the facet list as part of the tag vocabulary in Section
+21, not as a per-user preference.
+
+## 9.18 Indexes, Live Tail, and what "no results" actually means
+
+Log search runs against **indexed** logs in the indexes you have selected. Four
+different failures all look identical in the UI:
+
+1. **Not ingested.** The Agent or integration never sent it.
+2. **Ingested but excluded.** An exclusion filter dropped it at the index, so no
+   query will ever find it.
+3. **Indexed elsewhere.** Wrong index selected, or the time range excludes it.
+4. **Query error.** Case mismatch, missing facet for a numeric operator, or an
+   unescaped special character.
+
+Diagnose in that order. **Live Tail** streams logs as they arrive, before index
+routing and exclusion filters are applied - so a log visible in Live Tail may be
+entirely absent from search. That makes Live Tail the right tool to confirm
+*ingestion* and the wrong tool to confirm *searchability*.
+
+Monitors evaluate indexed logs only. `.index("*")` in a log monitor query spans
+all indexes; naming a single index narrows evaluation and can silently exclude
+data after an index routing change.
+
+## 9.19 Correlating logs with traces
+
+Log-to-trace correlation depends on the tracer injecting trace identifiers into
+the log record:
+
+```text
+@dd.trace_id:<id>
+@dd.span_id:<id>
+service:checkout env:prod status:error @dd.trace_id:*
+```
+
+That last query - error logs that *do* carry a trace id - is the fastest way to
+check whether injection is actually working before blaming the APM integration.
+`service`, `env`, and `version` must match between logs and traces for the
+correlation UI to link them; that is the strongest practical argument for the
+unified service tagging convention in Section 21.
 
 
 ---
@@ -2783,6 +2925,64 @@ When automating Datadog:
 
 ---
 
+## 17.8 Encoding, pagination, and rate limits
+
+### URL encoding
+
+Every query sent as a GET parameter must be encoded. The characters that bite:
+
+| Character | Encoded | Appears in |
+|---|---|---|
+| `@` | `%40` | Every event-platform attribute query |
+| `:` | `%3A` | Every tag and facet query |
+| space | `%20` | Boolean operators, phrases |
+| `"` | `%22` | Quoted tags, phrases |
+| `{` `}` | `%7B` `%7D` | Metric scopes |
+| `[` `]` | `%5B` `%5D` | Ranges, `page[size]` |
+| `,` | `%2C` | Multi-tag metric scopes |
+
+POST-based search endpoints (logs, RUM, CI, spans) take the query in a JSON
+body and need no encoding - prefer them for anything non-trivial, and for any
+query long enough to hit a URL length limit.
+
+### Pagination
+
+| API generation | Mechanism |
+|---|---|
+| v1 (monitors, hosts, SLOs) | `page[size]` / `page[number]`, or `start` / `count` depending on endpoint |
+| v2 event-platform (logs, spans, RUM, CI, audit) | Cursor: read `meta.page.after`, send it back as `page[cursor]` |
+| DDSQL | Async `query_id`, polled at a fetch endpoint; page with SQL `OFFSET`/`LIMIT` |
+
+Cursor pagination does not accept a page number. Any script that tries to "jump
+to page 5" against a v2 endpoint is silently wrong.
+
+### Rate limits
+
+Responses carry `X-RateLimit-Limit`, `X-RateLimit-Period`, `X-RateLimit-Remaining`,
+and `X-RateLimit-Reset`. Limits differ per endpoint family - log search, metric
+submission, and monitor writes each have their own budget.
+
+Practical rules for bulk automation:
+
+- Read `X-RateLimit-Remaining` and back off *before* you get a 429, not after.
+- On 429, honor `X-RateLimit-Reset` rather than a fixed sleep.
+- Batch reads (one list call plus local filtering) instead of one call per
+  object; a "get each monitor by id" loop is the usual cause of a rate-limit
+  incident during a migration.
+- Make writes idempotent: look up, diff, and `PATCH` only what changed. A retry
+  after a 429 should be a no-op if the previous attempt actually succeeded.
+
+### Permissions
+
+A 403 can mean a missing scope *or* an unlicensed product. `"Failed permission
+authorization checks"` in the response body confirms it is permissions. An
+application key can never grant more than its owner's role allows, so a key
+created by a restricted user will fail in ways that look like API bugs.
+
+
+---
+
+
 # 18. Time syntax reference
 
 
@@ -3024,6 +3224,14 @@ result, or custom metric has the same tag.
 12. **`.as_count()` changes rollup math.** For counters in monitors, set it explicitly and prefer `sum` aggregation.
 13. **Legacy vs current Events syntax** — `sources:` / `tags:` (v1) vs `source:` / tag-as-facet (v2). Don't mix them.
 14. **Docs can be wrong.** Validate metric names, tag keys, and field placements against Metrics Explorer or a live API response before scaling automation. Test one monitor/rule first, then bulk-apply with `--dry-run`.
+15. **Boolean operators must be uppercase.** `service:web and status:error` searches for the literal word `and`.
+16. **`status:` means three different things.** Severity in security signals, log level in Logs, monitor state in the Monitor List.
+17. **`?` is a single-character wildcard**, not a typo guard. It is the cleanest way to match a value containing a space or colon.
+18. **Event-level selection comes before filtering.** RUM (`@type:`), CI Visibility (pipeline/stage/job/command), and Error Tracking (issue vs. error) all return different result sets for the same filter string.
+19. **SLO monitors reference SLO IDs.** Deleting and re-creating an SLO orphans every error-budget and burn-rate monitor attached to it.
+20. **Removing a tag from a metric's tag configuration silently breaks group-by.** The metric keeps reporting; the dimension disappears, and every monitor grouped by it stops alerting.
+21. **Live Tail is not search.** It streams pre-index, so it shows logs that exclusion filters will drop and that no query will ever return.
+22. **Saved views carry more than the query** - columns, sort order, time range, and facet state. A saved view pinned to an absolute time range is a snapshot, not a live view.
 
 
 ---
@@ -3337,6 +3545,41 @@ production queries against the current docs.
 -   Metrics API\
     https://docs.datadoghq.com/api/latest/metrics/
 
+### Part II surfaces
+
+-   RUM Explorer Search Syntax\
+    https://docs.datadoghq.com/real_user_monitoring/explorer/search_syntax/
+
+-   RUM Search Events API\
+    https://docs.datadoghq.com/api/latest/rum/search-rum-events/
+
+-   Error Tracking Explorer\
+    https://docs.datadoghq.com/error_tracking/explorer
+
+-   CI Visibility Explorer Search Syntax\
+    https://docs.datadoghq.com/continuous_integration/explorer/search_syntax/
+
+-   CI/CD and Test Monitors\
+    https://docs.datadoghq.com/monitors/types/ci/
+
+-   Investigate Security Signals\
+    https://docs.datadoghq.com/security/cloud_siem/triage_and_investigate/investigate_security_signals/
+
+-   Search for SLOs (API)\
+    https://docs.datadoghq.com/api/latest/service-level-objectives/search-for-slos/
+
+-   Audit Trail\
+    https://docs.datadoghq.com/account_management/audit_trail/
+
+-   DDSQL API\
+    https://docs.datadoghq.com/api/latest/ddsql/
+
+-   DDSQL Data Directory\
+    https://docs.datadoghq.com/ddsql_reference/data_directory/
+
+-   Tag Policies API (preview)\
+    https://docs.datadoghq.com/api/latest/tag-policies/
+
 ------------------------------------------------------------------------
 
 
@@ -3395,3 +3638,726 @@ related metric, log, span, container, device, or Synthetic result.
 
 That small mental model turns Datadog filtering from a syntax jungle
 into a map.
+
+
+---
+
+# Part II — Extended product surfaces
+
+Sections 1–24 cover the surfaces most NOC and platform teams touch daily.
+Part II covers the remaining surfaces that use their own facets, their own
+attribute namespaces, or — in the case of DDSQL — an entirely different
+grammar.
+
+Everything in Part I still applies: **identify the data surface first**, then
+choose its query language. The per-surface "verify before you automate" rule
+applies even more strongly here, because several of these products are newer,
+are entitlement-gated, and are not available on every Datadog site (notably
+`app.ddog-gov.com` / `us2.ddog-gov.com`).
+
+| Section | Surface | Family |
+|---|---|---|
+| 25 | RUM and Session Replay | Event-platform |
+| 26 | Error Tracking | Event-platform (issue-level) |
+| 27 | CI Visibility and Test Optimization | Event-platform (log syntax) |
+| 28 | Security signals (Cloud SIEM, Workload Protection, AAP) | Event-platform |
+| 29 | SLOs | Faceted object search + metric/monitor queries |
+| 30 | Audit Trail | Event-platform |
+| 31 | DDSQL | SQL |
+| 32 | Notebooks, saved views, shareable URLs | Host product's family |
+| 33 | Tag governance surfaces | API/object |
+| 34 | Terraform and query-as-code | Embeds all of the above |
+| 35 | Other surfaces in brief | Mixed |
+| 36 | Part II decision addendum | — |
+
+---
+
+# 25. Real User Monitoring (RUM) and Session Replay
+
+RUM uses event-platform search, but with one twist that trips people up: the
+**event type selector changes which attributes exist**. A query that works on
+views will silently return nothing on sessions.
+
+## 25.1 Event types
+
+``` text
+@type:session
+@type:view
+@type:action
+@type:error
+@type:resource
+@type:long_task
+@type:vital
+```
+
+Rule of thumb:
+
+- **Session** — one user visit. Aggregates (`@session.error.count`) live here.
+- **View** — one page/screen. Performance attributes (`@view.loading_time`) live here.
+- **Action** — clicks, taps, custom actions.
+- **Resource** — network requests issued by the page (XHR, fetch, assets).
+- **Error** — front-end errors, crashes.
+- **Long task / vital** — main-thread blocking and Core Web Vitals.
+
+## 25.2 Common attributes
+
+``` text
+@application.id:<application-uuid>
+@session.type:user
+@session.type:synthetics
+@session.error.count:>5
+@session.error.count:[3 TO 10]
+@view.url_path:"/department/sofas"
+@view.loading_time:[1s TO 3s]
+@usr.id:12345
+@usr.email:someone@example.gov
+@error.source:console
+@resource.status_code:[500 TO 599]
+```
+
+Exclude synthetic browser-test traffic from user-facing numbers:
+
+``` text
+@type:view -@session.type:synthetics env:prod
+```
+
+## 25.3 Escaping, wildcards, and ranges
+
+| Want | Syntax |
+|---|---|
+| Exact path | `@view.url_path:"/department/sofas"` |
+| Path prefix (slashes escaped) | `@view.url_path:\/department\/sofas\/*` |
+| URL prefix | `@http.url:https:\/\/*` |
+| Facet name containing a space | `@user.first\ name:myvalue` |
+| Numeric comparison | `@session.error.count:>5` |
+| Numeric range | `@session.error.count:[3 TO 10]` |
+| Duration range with units | `@view.loading_time:[1s TO 3s]` |
+
+Wildcards are only wildcards **outside** double quotes. `@view.url_path:"*checkout*"`
+matches the literal string `*checkout*`.
+
+## 25.4 RUM-based metrics
+
+RUM-based metrics turn RUM events into a timeseries you can graph, monitor, and
+retain long-term:
+
+``` text
+event_type:  session | view | action | error | resource | long_task | vital
+filter:      service:web* AND @http.status_code:[200 TO 299]
+compute:     count  |  distribution on a path such as @duration
+group_by:    path @http.status_code  ->  tag_name status_code
+```
+
+Notes:
+
+- `group_by.tag_name` is the **tag key the metric will carry**. It does not have
+  to match the attribute path, and renaming it later breaks existing queries.
+- Distribution metrics can include percentiles; that increases custom metric
+  volume, so decide deliberately.
+
+## 25.5 RUM search API
+
+``` json
+POST /api/v2/rum/events/search
+{
+  "filter": {
+    "from": "now-15m",
+    "query": "@type:session AND @session.type:user",
+    "to": "now"
+  },
+  "options": { "timezone": "GMT" },
+  "page": { "limit": 25 },
+  "sort": "timestamp"
+}
+```
+
+`sort` accepts `timestamp` or `-timestamp`. Paginate with the cursor returned in
+`meta.page.after`, passed back as `page.cursor`.
+
+## 25.6 RUM monitors
+
+RUM monitors follow the log-monitor shape: a RUM search query, an event level
+(session/view/error/…), a count or measure, optional group-by, and a threshold.
+Group by `@application.id` or `service` so notification routing can distinguish
+front-end applications.
+
+---
+
+# 26. Error Tracking
+
+Error Tracking is not a separate search language — it is an **aggregation layer**
+over errors already present in Logs, APM, and RUM. The unit you search is an
+**issue**, not an individual error event.
+
+## 26.1 How issues are formed
+
+Datadog computes a fingerprint for each error from attributes such as the error
+type, the error message, and the stack trace; errors sharing a fingerprint are
+grouped into one issue. This matters operationally: a badly formatted error
+message that embeds a unique ID (a request ID, a hostname, a timestamp) can
+fragment one bug into thousands of issues.
+
+## 26.2 Issue markers
+
+| Marker | Meaning |
+|---|---|
+| **New** | First seen less than two days ago and still in the *For Review* state |
+| **Regression** | Was resolved, then occurred again in a newer version |
+| **Crash** | The error crashed the application |
+| **Suspected cause** | Datadog has inferred a likely originating change |
+
+Issue states drive triage workflow (for review / resolved / ignored). The state
+is exposed as a facet in the explorer — confirm the exact facet key in the facet
+panel before scripting against it, because it differs from the human-readable
+label.
+
+## 26.3 Searching
+
+Search terms are the attributes of the underlying error source, so the usable
+attribute set depends on where the errors came from:
+
+``` text
+service:checkout env:prod @error.type:TimeoutError
+service:checkout @error.message:*connection\ refused*
+@error.source:logger version:2.4.1
+```
+
+Sorting options — Relevance, Count, Newest, Impacted Sessions — change which
+issues surface first but not which issues match. For dashboards and reports,
+sort by Count; for triage, Relevance.
+
+## 26.4 Operational advice
+
+- Version tagging is what makes Regression detection work. Without a consistent
+  `version:` tag, Error Tracking cannot tell a regression from a recurrence.
+- Error Tracking monitors alert on issue volume or on new issues appearing;
+  route them by `service` and `team`, not by issue.
+
+---
+
+# 27. CI Visibility and Test Optimization
+
+CI Visibility pipeline and test events are searched with **log search syntax** —
+the same grammar as Section 9, including `-` negation, `@` attributes, ranges,
+and the "wildcards only outside quotes" rule.
+
+## 27.1 Pipeline attributes
+
+``` text
+@ci.status:error
+@ci.status:(success OR error OR canceled)
+@ci.pipeline.name:"deploy-prod"
+@ci.pipeline.id:<id>
+@ci.stage.name:build
+@ci.job.name:unit-tests
+@git.branch:main
+@git.repository.id_v2:<repo>
+```
+
+## 27.2 Event levels
+
+CI pipeline data is hierarchical: **pipeline → stage → job → command**. The
+level is a first-class selector, not just another filter:
+
+- In the explorer, the level is chosen in the UI next to the search bar.
+- In a CI monitor, the level is a separate configuration field.
+- Some views expose a level facet; confirm its key in the facet panel before
+  hard-coding it into automation.
+
+Searching at the wrong level is the single most common CI Visibility mistake:
+counting `@ci.status:error` at job level and at pipeline level gives very
+different numbers for the same failure.
+
+## 27.3 Test attributes
+
+``` text
+@test.status:fail
+@test.name:"test_login_redirect"
+@test.suite:auth
+@test.service:web-api
+@test.is_flaky:true
+```
+
+## 27.4 CI/CD and Test monitors
+
+- Alert on a **count** of matching events, or on a **measure** (a quantitative
+  facet) with an aggregation: `min`, `avg`, `sum`, `median`, `pc75`, `pc90`,
+  `pc95`, `pc98`, `pc99`, `max`.
+- Group by up to **four** facets; each group alerts independently. Grouping by
+  `@ci.pipeline.name` gives one alert per pipeline.
+- Rates are built with formulas — for example, failed pipeline events (query a:
+  `@ci.status:error`) over total pipeline events (query b: no filter), with
+  formula `a / b`, grouped by `@ci.pipeline.name`.
+- There is a default limit of 1000 CI/CD and Test monitors per account.
+
+## 27.5 APIs
+
+``` text
+POST /api/v2/ci/pipelines/events/search
+POST /api/v2/ci/tests/events/search
+GET  /api/v2/ci/pipelines/events?filter[query]=...
+GET  /api/v2/ci/tests/events?filter[query]=...
+```
+
+These take a log search query and paginate the same way the Logs API does
+(cursor in `meta.page.after`).
+
+---
+
+# 28. Security signals (Cloud SIEM, Workload Protection, App and API Protection)
+
+All of Datadog's signal explorers share one search model. The signal is an
+event-platform record; detection rules that *produce* signals are written in the
+log search syntax of whatever data they analyze.
+
+## 28.1 Signal search
+
+``` text
+status:(critical OR high)
+status:(high OR critical OR medium) @workflow.triage.state:(open OR under_review)
+@workflow.rule.name:"Excessive login failures"
+@workflow.rule.type:"Application Security"
+```
+
+| Attribute | Values |
+|---|---|
+| `status` | `info`, `low`, `medium`, `high`, `critical` |
+| `@workflow.triage.state` | `open`, `under_review`, `archived` |
+| `@workflow.rule.name` | Detection rule name |
+| `@workflow.rule.type` | Product/rule family |
+
+Note the vocabulary collision: `status` means **severity** for security signals,
+but **log level** in Log Explorer and **monitor state** in the Monitor List.
+Three surfaces, one word, three meanings.
+
+## 28.2 Detection rules and suppressions
+
+A detection rule carries one or more queries in log search syntax plus a
+grouping and a threshold. Suppressions are separate objects with two queries:
+
+``` text
+rule_query:        ruleId:abc-def-ghi OR ruleId:jkl-mno-pqr
+suppression_query: @usr.email:(svc-account@example.gov) AND @network.client.ip:10.0.0.0/8
+```
+
+Suppression is the correct tool for approved service accounts and known scanner
+hosts — muting the signal downstream hides the finding instead of scoping it.
+
+## 28.3 Notification rules
+
+Security signal notification rules are a **different object** from monitor
+notification rules (Section 6.8) with a different filter vocabulary. Rules for
+monitors will never match signals, and vice versa.
+
+---
+
+# 29. Service Level Objectives
+
+SLOs involve three distinct query surfaces at once, which is why they confuse
+people: the SLO **object search**, the **SLI query** inside the SLO, and the
+**error-budget monitor** built on top.
+
+## 29.1 SLO list search
+
+The Manage SLOs list is a faceted object search over SLO definitions:
+
+``` text
+service:checkout
+team:noc
+slo_type:metric
+env:prod
+"Checkout Availability"
+```
+
+Search API:
+
+``` text
+GET /api/v1/slo/search?query=service:checkout&page[size]=25&page[number]=0&include_facets=true
+```
+
+`include_facets=true` returns the facet breakdown Datadog itself uses:
+`all_tags`, `creator_name`, `env_tags`, `service_tags`, `slo_type`, `target`,
+`team_tags`, `timeframe`. That response is the cheapest way to audit which tag
+keys are actually present on SLOs before running a governance sweep. The
+endpoint requires the `slos_read` permission.
+
+## 29.2 SLI queries by SLO type
+
+| SLO type | What the query looks like |
+|---|---|
+| **Metric-based** | Two metric queries — numerator (good events) and denominator (total events), both usually `.as_count()` |
+| **Monitor-based** | References monitor IDs, not a query; the monitor's own query is the SLI |
+| **Time slice** | A metric query plus a condition evaluated per slice, e.g. `avg:system.cpu.user{app:abc} < 80` |
+
+Metric-based example:
+
+``` text
+numerator:   sum:trace.http.request.hits{env:prod,service:checkout}.as_count() - sum:trace.http.request.errors{env:prod,service:checkout}.as_count()
+denominator: sum:trace.http.request.hits{env:prod,service:checkout}.as_count()
+```
+
+## 29.3 Error budget monitors
+
+Error-budget and burn-rate monitors reference the SLO by ID rather than
+re-stating the query:
+
+``` text
+error_budget("<slo_id>").over("7d") > 75
+burn_rate("<slo_id>").over("1h").long_window("24h") > 14.4
+```
+
+Because they reference an ID, renaming or re-creating an SLO silently orphans
+its monitors. Treat SLO IDs as durable identifiers in any automation.
+
+## 29.4 Tagging
+
+SLO tags are their own tag set — they are not inherited from the metrics,
+monitors, or services inside the SLO. A tag governance policy that checks hosts
+and monitors but not SLOs will report clean while SLO routing is broken.
+
+---
+
+# 30. Audit Trail
+
+Audit Trail records configuration and access events for the Datadog org itself.
+For regulated environments this is the surface that answers "who changed this
+monitor, and when" — and it is searched with ordinary event-platform syntax.
+
+## 30.1 Core attributes
+
+| Attribute | Meaning |
+|---|---|
+| `@evt.name` | Product area — `Monitors`, `Metrics`, `Log Management`, `APM`, `Synthetics Monitoring`, `Real User Monitoring`, `Sensitive Data Scanner`, `api_key` |
+| `@asset.type` | Object type — `monitor`, `index`, `metric`, `synthetics_test`, `retention_filter`, `custom_metrics` |
+| `@action` | `created`, `modified`, `deleted` |
+| `@usr.email`, `@usr.id`, `@usr.name` | Actor |
+| `@metadata.api_key.id` | API key used (key id, never the key itself) |
+| `@http.method`, `@http.url_details.path` | API call shape |
+| `@network.client.ip`, `@network.client.geoip.country.name` | Source of the change |
+
+## 30.2 Useful queries
+
+``` text
+# Monitor changes in the last day
+@evt.name:Monitors @action:(created OR modified OR deleted)
+
+# Metric tag configuration changes
+@evt.name:Metrics @asset.type:metric @action:(created OR modified)
+
+# Log index or retention changes
+@evt.name:"Log Management" @asset.type:index
+
+# Synthetic tests created or deleted
+@evt.name:"Synthetics Monitoring" @asset.type:synthetics_test @action:(created OR deleted)
+
+# Everything done with a specific API key
+@metadata.api_key.id:<key-id>
+
+# Changes made by anything other than your automation accounts
+@action:modified -@usr.email:(automation@example.gov OR terraform@example.gov)
+```
+
+## 30.3 Operational uses
+
+- **Key rotation verification** — after rotating a key, confirm the old key id
+  stops appearing in `@metadata.api_key.id`.
+- **Change attribution during migration** — when a monitor's behavior changes
+  unexpectedly, the diff tab on an audit event shows the before/after config.
+- **Drift detection** — alert on `@action:modified` for objects that should only
+  ever be changed by automation.
+
+Audit events can be exported to a log index or queried through DDSQL
+(Section 31), which is usually easier for scheduled compliance reporting.
+
+---
+
+# 31. DDSQL — SQL over Datadog data
+
+DDSQL is the fourth syntax family and the newest. It queries Datadog's data
+catalog with SQL rather than a search bar, which makes it the right tool for
+joins, aggregates, and inventory reporting that the explorers cannot express.
+
+## 31.1 Shape
+
+``` sql
+SELECT COUNT(*) FROM dd.hosts;
+
+SELECT cloud_provider, COUNT(*) AS hosts
+FROM dd.hosts
+GROUP BY cloud_provider
+ORDER BY hosts DESC;
+```
+
+Datasets live under the `dd.` namespace (`dd.hosts`, `dd.audit`, and others in
+the DDSQL Data Directory). Host tags arrive as an `hstore`-style key/value
+column rather than a flat string, so tag predicates look like column access,
+not like `{env:prod}`.
+
+## 31.2 Table functions embed event-platform search
+
+Some datasets are **polymorphic table functions**: they require parameters, and
+one of those parameters is an ordinary event-platform query string. This is the
+one place where two syntax families legitimately appear in the same statement:
+
+``` sql
+SELECT * FROM dd.audit(
+  columns => ARRAY['timestamp','@usr.email','@evt.name','@metadata.api_key.id'],
+  filter  => '@metadata.api_key.id:* AND @evt.name:api_key',
+  from_timestamp => now() - interval '24 hours',
+  to_timestamp   => now()
+) AS (ts TIMESTAMP, user_email VARCHAR, event_name VARCHAR, api_key_id VARCHAR);
+```
+
+The `filter` string follows Section 30 rules; the surrounding statement follows
+SQL rules. Do not try to express the filter as a SQL `WHERE` clause — the
+function needs it up front.
+
+## 31.3 API
+
+``` text
+POST /api/v2/ddsql/query/tabular          # submit
+POST /api/v2/ddsql/query/tabular/fetch    # poll with query_id
+```
+
+Queries are dispatched asynchronously. The submit call returns either
+`state: completed` with the result set inlined, or `state: running` plus an
+opaque `query_id`; poll the fetch endpoint with that id until it completes.
+Results are **column-major** — a list of columns each holding a list of values,
+not a list of row objects — so client code that assumes row dictionaries needs a
+transposition step.
+
+Other practical notes:
+
+- Row limit defaults to 5000; page with SQL `OFFSET n LIMIT m` rather than
+  client-side slicing.
+- Timestamps and dates come back as Unix milliseconds; a `DATE` resolves to
+  midnight UTC.
+- Bound time with the table function's own `from_timestamp` / `to_timestamp`
+  parameters where they exist, rather than a `WHERE` clause on a time column.
+
+## 31.4 When to reach for DDSQL
+
+| Question | Better surface |
+|---|---|
+| "How many hosts per cloud provider, per tag value?" | DDSQL |
+| "Which hosts are missing the `app` tag?" | DDSQL, or the Hosts API |
+| "Show me CPU for these hosts over time" | Metrics (Section 8) |
+| "What changed last night?" | Audit Trail, or DDSQL over `dd.audit` for scheduled reports |
+
+---
+
+# 32. Notebooks, saved views, and shareable URLs
+
+## 32.1 Notebooks
+
+Notebook cells embed whichever query language the cell's data source uses — a
+metric cell takes metric syntax, a log cell takes log search syntax. Notebooks
+also support log **full-text search** (`*:term`), which is one of the few places
+outside the Log Explorer where it works, along with monitors and dashboards.
+
+## 32.2 Saved views
+
+A saved view stores more than the query. In the explorers it captures the search
+query, the visible columns, the sort order, the time range, and the facet panel
+state. Two consequences:
+
+- A saved view with an absolute time range is a snapshot, not a live view.
+- Sharing a saved view shares the columns and sort, which is often the actual
+  knowledge being transferred — the query alone is rarely enough.
+
+## 32.3 URLs as an API
+
+Explorer URLs carry the query as a parameter, which makes them scriptable
+deep links for runbooks and notification messages:
+
+``` text
+/logs?query=service%3Acheckout%20status%3Aerror&from_ts=...&to_ts=...&live=true
+/monitors/manage?q=status%3AAlert%20tag%3A%22app%3Aabc%22
+/metric/explorer?exp_metric=system.cpu.user&exp_scope=env%3Aprod
+```
+
+Rules that save time:
+
+- URL-encode the whole query: `@` becomes `%40`, `:` becomes `%3A`, space
+  becomes `%20`, `{` `}` `[` `]` `"` all need encoding.
+- Dashboard and explorer URLs use epoch **milliseconds** for time bounds
+  (Section 18).
+- A deep link in a monitor message is worth more than a paragraph of
+  explanation; put the exact filtered view the responder needs in the runbook
+  field.
+
+---
+
+# 33. Tag governance surfaces
+
+Filtering is only as good as the tags underneath it. These are the surfaces that
+govern the tags themselves.
+
+## 33.1 Tag Policies
+
+Tag Policies define which tag values are accepted for a given tag key, scoped to
+a telemetry source (logs, spans, metrics, and so on). Policies are either:
+
+- **blocking** — telemetry that does not match is rejected, or
+- **surfacing** — non-matching data is highlighted but still ingested.
+
+Each policy reports a **compliance score** derived from how much recent
+telemetry adheres to it.
+
+``` text
+GET    /api/v2/tag_policies            # list; include=score for compliance
+POST   /api/v2/tag_policies            # create
+GET    /api/v2/tag_policies/{policy_id}
+DELETE /api/v2/tag_policies/{policy_id}   # soft delete by default
+GET    /api/v2/tag_policies/{policy_id}/score
+```
+
+Caveats:
+
+- This API is in preview; the path has already changed once (hyphen to
+  underscore). Pin nothing without checking a live response first.
+- `blocking` mode drops data. Run a policy in `surfacing` mode long enough to
+  see its score stabilize before switching it.
+- Requires `telemetry_rules_read` / `metrics_read` (read) permissions.
+
+## 33.2 Metric tag configuration
+
+Metric-level tag configuration controls which tags are queryable on a custom
+metric. Removing a tag from the configuration makes every existing query and
+monitor that groups by that tag return nothing — the metric still exists, the
+dimension does not. Audit tag configuration changes through Audit Trail
+(`@evt.name:Metrics @asset.type:metric`).
+
+## 33.3 Restriction policies
+
+Restriction policies bind roles to individual resources (a dashboard, a monitor,
+a notebook) rather than to a whole product. They are the reason a query can work
+for you and return nothing for a teammate. When a user reports missing data,
+check restriction policies and role scopes before debugging the query itself.
+
+## 33.4 A governance checklist that survives an audit
+
+1. One canonical tag key list, lowercase, documented.
+2. Normalize values **before** submission, on every path — Agent, API, and
+   DogStatsD — because only the Agent path lowercases reliably.
+3. Check tag presence on every object type, not just hosts: monitors,
+   synthetics, SLOs, dashboards, log pipelines, APM services.
+4. Report compliance as a trend, not a snapshot; a single-point score hides
+   whether a migration is converging.
+5. Gate automation on a dry run that prints per-field changes.
+
+---
+
+# 34. Terraform and query-as-code
+
+Query strings are **opaque to Terraform**. The provider will happily apply a
+syntactically valid monitor whose query matches nothing.
+
+## 34.1 Interpolation collisions
+
+Terraform interpolates `${...}`. Datadog monitor messages use `{{...}}` for
+template variables, and Datadog dashboards use `$var` for template variables.
+The failure modes:
+
+``` hcl
+# WRONG - Terraform tries to interpolate
+message = "CPU high on ${host.name}"
+
+# RIGHT - escape the dollar sign for Terraform
+message = "CPU high on $${host.name}"
+
+# Monitor template variables use double braces and are safe
+message = "CPU high on {{host.name}} for {{app.name}}"
+```
+
+## 34.2 Drift and diff noise
+
+- Datadog normalizes some queries server-side (whitespace, operator spelling).
+  A query written as `{env:prod AND app:abc}` may come back as
+  `{env:prod,app:abc}`, producing perpetual diffs. Write queries in the form the
+  API returns them.
+- `validate = true` on a monitor resource asks Datadog to validate the query at
+  plan time. Use it; it converts a silent no-match into a plan failure.
+- Monitor `restricted_roles` and restriction policies can be managed in two
+  places at once. Pick one and stay there.
+
+## 34.3 Generated over handwritten
+
+For large estates, generate monitor and dashboard definitions from a single
+source of truth (a CSV or YAML inventory) rather than maintaining hundreds of
+near-identical blocks. The generator owns naming, tagging, and query shape;
+the state file owns lifecycle. The same argument applies to Python automation
+against the API directly: keep the query construction in one function so a
+syntax fix lands everywhere at once.
+
+---
+
+# 35. Other surfaces in brief
+
+These surfaces reuse a family already covered; only their vocabulary differs.
+Confirm attribute names in the product's facet panel before automating.
+
+| Surface | Family | Notes |
+|---|---|---|
+| **Incident Management** | Faceted object search | Facets such as state, severity, commander, and incident tags. Incident search is separate from the monitors and signals that created the incident. |
+| **Case Management** | Faceted object search | Cases group signals or issues for triage; case attributes are not signal attributes. |
+| **Cloud Cost Management** | Metric-style with cost-specific tag keys | Cost data is queried like metrics, scoped by cloud and allocation tags. Tag coverage on cloud resources determines whether cost can be split by team or application at all. |
+| **Software Catalog / Teams** | Faceted object search | Entity-level search over services and their owners; `team` here is a catalog concept, not automatically the `team:` tag on telemetry. |
+| **Workflow Automation** | Trigger filters use the source product's syntax | A monitor-triggered workflow filters on monitor tags; a signal-triggered workflow filters on signal attributes. |
+| **Fleet Automation** | Faceted inventory search | Agent version, config state, and host tags. Useful for verifying deployment coverage during a migration. |
+| **Sensitive Data Scanner** | Log search syntax for scope | The scanning group scope is an ordinary log query; scanning rules are regex-based on top of it. |
+
+---
+
+# 36. Part II decision addendum
+
+``` text
+EXTENDED DECISION TREE (Part II surfaces)
+=========================================
+
+What are you searching?
+
+├── Front-end user experience
+│   └── RUM event search — pick the event type FIRST
+│       ├── @type:session   (session-level aggregates)
+│       ├── @type:view      (page performance)
+│       └── @type:error     (front-end errors)
+│
+├── Grouped application errors ("which bug?")
+│   └── Error Tracking — searches ISSUES, not events
+│
+├── Builds, pipelines, tests
+│   └── CI Visibility — log syntax, but pick the LEVEL
+│       └── pipeline / stage / job / command
+│
+├── Threats and detections
+│   └── Signal search
+│       ├── status: = SEVERITY here (not log level, not monitor state)
+│       └── @workflow.triage.state:(open OR under_review OR archived)
+│
+├── Reliability targets
+│   └── Three surfaces at once
+│       ├── SLO list search        (find the SLO object)
+│       ├── SLI query              (metric / monitor / time slice)
+│       └── error_budget(<id>)     (monitor on top)
+│
+├── "Who changed this?"
+│   └── Audit Trail — @evt.name + @asset.type + @action
+│
+├── Inventory, joins, aggregate reporting
+│   └── DDSQL — SELECT ... FROM dd.<dataset>
+│       └── table functions take an event-search string as a parameter
+│
+└── Tag correctness itself
+    └── Tag Policies / metric tag configuration / Audit Trail
+```
+
+## Two rules worth repeating
+
+> **`status:` means three different things.** Severity in security signals, log
+> level in Logs, monitor state in the Monitor List. Read the surface, then the
+> word.
+
+> **Newer surface, weaker guarantee.** Everything in Part II is more likely to
+> be entitlement-gated, site-restricted, or in preview than anything in Part I.
+> Validate against a live API response before you build automation on it.
